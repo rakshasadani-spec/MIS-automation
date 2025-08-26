@@ -1,10 +1,11 @@
-import os, sys, time, zipfile, smtplib, ssl
+# bot.py
+import os, sys, time, zipfile, smtplib, ssl, re
 from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from email.message import EmailMessage
 
-import pandas as pd
+import pandas as pd  # keep installed even if not used yet
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ----------------- Config via env / GitHub Secrets -----------------
@@ -47,9 +48,16 @@ def send_email(subject: str, body: str, attach_path: Path):
     with open(attach_path, "rb") as f:
         data = f.read()
 
-    # Guess subtype (pdf vs xlsx)
-    subtype = "pdf" if attach_path.suffix.lower() == ".pdf" else "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    msg.add_attachment(data, maintype="application", subtype=subtype, filename=attach_path.name)
+    # Guess subtype (pdf vs xlsx vs general octet)
+    ext = attach_path.suffix.lower()
+    if ext == ".pdf":
+        maintype, subtype = "application", "pdf"
+    elif ext in (".xlsx", ".xls"):
+        maintype, subtype = "application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        maintype, subtype = "application", "octet-stream"
+
+    msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=attach_path.name)
 
     ctx = ssl.create_default_context()
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
@@ -69,13 +77,14 @@ def save_download(download, dest_dir: Path) -> Path:
             extracted = dest_dir / Path(first).name
             with zf.open(first) as src, open(extracted, "wb") as dst:
                 dst.write(src.read())
+            print(f"ZIP extracted: {extracted}")
             return extracted
     return out
 
 def pick_status_col_and_click_latest(page):
     """
     On 'Reports Generated', click the latest row's control in the 'Status' column.
-    Tries common <a>/<button>/<i> inside that cell and expects a file download.
+    Tries common <a>/<button>/<i>/<span> inside that cell and expects a file download.
     """
     table = page.locator("table").first
     table.wait_for(timeout=60000)
@@ -90,8 +99,11 @@ def pick_status_col_and_click_latest(page):
             break
     if status_idx is None:
         status_idx = count  # fallback: last column
+    print(f"Detected Status column index: {status_idx}")
 
     first_row = table.locator("tbody tr").first
+    if first_row.count() == 0:
+        raise RuntimeError("No rows found in 'Reports Generated' table.")
 
     # Try common clickable controls within the Status cell
     candidates = [
@@ -103,14 +115,105 @@ def pick_status_col_and_click_latest(page):
     for sel in candidates:
         loc = first_row.locator(sel)
         if loc.count() > 0:
+            print(f"Clicking Status cell control via selector: {sel}")
             try:
                 with page.expect_download(timeout=120000) as dl:
                     loc.first.click()
                 return dl.value
             except PWTimeout:
-                pass
+                print("Click did not trigger a download; trying next candidate...")
+                continue
     raise RuntimeError("Could not trigger download from the Status cell.")
 
+# -------- Robust report picker --------
+TARGET_TEXT = "statement of capital flows"
+
+def try_select_dropdown(page) -> bool:
+    """Scan all <select> elements and choose an option whose visible text contains our target (case-insensitive)."""
+    selects = page.locator("select")
+    n = selects.count()
+    print(f"Found {n} <select> element(s).")
+    for i in range(n):
+        sel = selects.nth(i)
+        # Collect option texts/values and print them to logs for debugging
+        options = sel.evaluate(
+            """s => Array.from(s.options).map(o => ({value:o.value, text:(o.textContent||'').trim()}))"""
+        )
+        print(f"[Report select #{i}] options: {options}", flush=True)
+        # Find a case-insensitive contains match
+        match = None
+        for opt in options:
+            if TARGET_TEXT in opt["text"].lower():
+                match = opt
+                break
+        if match:
+            print(f"Matched option on select #{i}: {match}")
+            try:
+                if match["value"]:
+                    sel.select_option(value=match["value"])
+                else:
+                    sel.select_option(label=match["text"])
+                return True
+            except Exception as e:
+                print(f"Select #{i} matched but selection failed: {e}", flush=True)
+    return False
+
+def try_custom_dropdown(page) -> bool:
+    """Handle non-<select> dropdowns (comboboxes/menus) using regex matches."""
+    openers = [
+        '[role="combobox"]',
+        'div[aria-haspopup="listbox"]',
+        'button[aria-haspopup="listbox"]',
+        'button:has-text("Select")',
+        'button:has-text("Report")',
+        'label:has-text("Report") + *',
+        'div[role="button"]',
+    ]
+    opened = False
+    for op in openers:
+        loc = page.locator(op).first
+        if loc.count() > 0:
+            print(f"Trying to open custom dropdown via: {op}")
+            loc.click()
+            opened = True
+            page.wait_for_timeout(600)
+            break
+    if not opened:
+        print("Could not positively identify a dropdown opener; trying to focus via Tab...")
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(300)
+
+    # Try clicking the item by regex (case-insensitive)
+    pattern_main = re.compile(r"Statement\s+of\s+Capital\s+Flows", re.I)
+    pattern_alt  = re.compile(r"Capital\s+Flow", re.I)
+
+    item = page.get_by_text(pattern_main).first
+    if item.count() == 0:
+        item = page.get_by_text(pattern_alt).first
+
+    if item.count() > 0:
+        print("Clicking dropdown item by text regex match.")
+        item.click()
+        return True
+
+    # Role-based attempt
+    candidates = page.get_by_role("option", name=pattern_main)
+    if candidates.count() == 0:
+        candidates = page.get_by_role("option", name=pattern_alt)
+    if candidates.count() == 0:
+        candidates = page.get_by_role("menuitem", name=pattern_main)
+    if candidates.count() == 0:
+        candidates = page.get_by_role("menuitem", name=pattern_alt)
+
+    if candidates.count() > 0:
+        print("Clicking role-based dropdown candidate.")
+        candidates.first.click()
+        return True
+
+    print("Custom dropdown selection failed to find the target item.")
+    return False
+
+# ----------------- Main flow -----------------
 def run_bot():
     if not PORTAL_USER or not PORTAL_PASS:
         raise RuntimeError("Missing PORTAL_USER or PORTAL_PASS. Set GitHub Secrets.")
@@ -121,134 +224,13 @@ def run_bot():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(accept_downloads=True)
+        # Start tracing for diagnostics
+        context.tracing.start(screenshots=True, snapshots=True, sources=True)
         page = context.new_page()
 
-        # -------- 1) Login --------
-        page.goto(LOGIN_URL, timeout=120000)
+        try:
+            # -------- 1) Login --------
+            print("Navigating to login page...")
+            page.goto(LOGIN_URL, timeout=120000)
 
-        # Fill username
-        for sel in ['input[name="username"]', 'input[name="email"]', '#username', '#loginId', 'input[type="text"]']:
-            if page.locator(sel).count() > 0:
-                page.fill(sel, PORTAL_USER)
-                break
-        else:
-            raise RuntimeError("Username field not found. Update selector.")
-
-        # Fill password
-        for sel in ['input[name="password"]', '#password', 'input[type="password"]']:
-            if page.locator(sel).count() > 0:
-                page.fill(sel, PORTAL_PASS)
-                break
-        else:
-            raise RuntimeError("Password field not found. Update selector.")
-
-        # Click submit
-        for sel in ['button[type="submit"]', 'button:has-text("Login")', 'button:has-text("Sign in")', '#login', 'input[type="submit"]']:
-            if page.locator(sel).count() > 0:
-                page.click(sel)
-                break
-        else:
-            raise RuntimeError("Login button not found. Update selector.")
-
-        page.wait_for_load_state("networkidle")
-
-        # -------- 2) Go to Reports tab --------
-        for sel in ['a:has-text("Reports")', 'button:has-text("Reports")', 'li:has-text("Reports") >> a', 'text=Reports']:
-            if page.locator(sel).count() > 0:
-                page.click(sel)
-                break
-        else:
-            raise RuntimeError("Reports tab not found. Update selector.")
-        page.wait_for_load_state("networkidle")
-
-        # -------- 3) Choose 'Statement of Capital Flows' --------
-        # If it's a real <select>
-        if page.locator('select').count() > 0:
-            selects = page.locator("select")
-            picked = False
-            for i in range(selects.count()):
-                sel = selects.nth(i)
-                try:
-                    sel.select_option(label="Statement of Capital Flows")
-                    picked = True
-                    break
-                except Exception:
-                    pass
-            if not picked:
-                raise RuntimeError("Could not select 'Statement of Capital Flows' in a <select>.")
-        else:
-            # Custom dropdown (combobox style)
-            # Try to open the dropdown
-            opened = False
-            for opener in ['[role="combobox"]', 'div[aria-haspopup="listbox"]', 'button:has-text("Select")', 'text=Statement of']:
-                if page.locator(opener).count() > 0:
-                    page.click(opener)
-                    opened = True
-                    break
-            if not opened:
-                # Sometimes clicking the label focuses it
-                page.keyboard.press("Tab")
-            item = page.locator('text="Statement of Capital Flows"').first
-            if item.count() == 0:
-                item = page.locator('text=Statement of Capital Flows').first
-            if item.count() == 0:
-                raise RuntimeError("Report option 'Statement of Capital Flows' not found.")
-            item.click()
-
-        # -------- 4) Set date = yesterday (IST) --------
-        # Try common date input selectors and formats
-        date_set = False
-        for sel in ['input[type="date"]', 'input[name*="date"]', '#fromDate', '#asOnDate', 'input[placeholder*="Date"]', 'input[placeholder*="date"]']:
-            if page.locator(sel).count() > 0:
-                for val in [dates["yyyy_mm_dd"], dates["dd_mmm_yyyy"], dates["dd_mm_yyyy"], dates["dd_mm_yyyy_dash"]]:
-                    try:
-                        page.fill(sel, "")
-                        page.fill(sel, val)
-                        # If readonly, set via JS
-                        readonly = page.locator(sel).evaluate("el => el.readOnly || el.getAttribute('readonly') !== null")
-                        if readonly:
-                            page.evaluate("(el, v) => { el.value = v; el.dispatchEvent(new Event('input', {bubbles:true})); }", page.locator(sel), val)
-                        date_set = True
-                        break
-                    except Exception:
-                        pass
-                if date_set:
-                    break
-        if not date_set:
-            print("Date input not set — if it's a calendar widget, replace with explicit picker clicks.", file=sys.stderr)
-
-        # -------- 5) Click Execute / Generate --------
-        clicked = False
-        for sel in ['button:has-text("Execute")', 'button:has-text("Generate")', 'button:has-text("Submit")', 'input[type="submit"]']:
-            if page.locator(sel).count() > 0:
-                page.click(sel)
-                clicked = True
-                break
-        if not clicked:
-            raise RuntimeError("Execute/Generate button not found. Update selector.")
-
-        # Site redirects to 'Reports Generated'
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(3000)  # give backend a moment
-
-        # -------- 6) On 'Reports Generated' → click latest 'page icon' under Status --------
-        download = pick_status_col_and_click_latest(page)
-        saved = save_download(download, DOWNLOAD_DIR)
-
-        # -------- 7) Email the downloaded file (as-is) --------
-        send_email(
-            subject=f"Statement of Capital Flows — {datetime.now(IST).strftime('%d %b %Y')}",
-            body="Automated download attached.",
-            attach_path=saved
-        )
-        print(f"Downloaded and emailed: {saved}")
-
-        context.close()
-        browser.close()
-
-if __name__ == "__main__":
-    try:
-        run_bot()
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        raise
+            #
